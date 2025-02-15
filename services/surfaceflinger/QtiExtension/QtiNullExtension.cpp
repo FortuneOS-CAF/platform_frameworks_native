@@ -109,6 +109,12 @@ status_t QtiNullExtension::qtiBinderSetPanelBrightnessTiled(uint64_t displayId, 
 status_t QtiNullExtension::qtiBinderSetWideModePreference(uint64_t displayId, int32_t pref) {
     return OK;
 }
+
+status_t QtiNullExtension::qtiDoDumpContinuous(int fd, const DumpArgs& args) {
+    return OK;
+}
+void QtiNullExtension::qtiDumpDrawCycle(bool prePrepare) {}
+
 /*
  * Methods for Virtual, WiFi, and Secure Displays
  */
@@ -206,5 +212,33 @@ bool QtiNullExtension::qtiFbScalingOnDisplayChange(const wp<IBinder>& displayTok
 }
 
 void QtiNullExtension::qtiFbScalingOnPowerChange(sp<DisplayDevice> display) {}
+
+void QtiNullExtension::qtiDumpMini(std::string& result) {}
+
+/*
+ * Methods for multiple displays
+ */
+// enable/disable h/w composer event
+// TODO: this should be made accessible only to EventThread
+// main thread function to enable/disable h/w composer event
+sp<DisplayDevice> QtiNullExtension::qtiGetVsyncSource() {
+    return nullptr;
+}
+void QtiNullExtension::qtiUpdateVsyncSource() {}
+nsecs_t QtiNullExtension::qtiGetVsyncPeriodFromHWC() const {
+    return 0;
+}
+void QtiNullExtension::qtiUpdateNextVsyncSource() {}
+void QtiNullExtension::qtiUpdateActiveVsyncSource() {}
+bool QtiNullExtension::qtiIsDummyDisplay(const sp<DisplayDevice>& display) {
+    return false;
+}
+
+void QtiNullExtension::qtiUpdateActiveDisplayOnRemove(PhysicalDisplayId id) {}
+void QtiNullExtension::qtiUpdateActiveDisplayOnPowerOn(PhysicalDisplayId id) {}
+void QtiNullExtension::qtiUpdateActiveDisplayOnPowerOff(PhysicalDisplayId id) {}
+sp<DisplayDevice> QtiNullExtension::qtiGetVsyncSourceForFence() {
+    return nullptr;
+}
 
 } // namespace android::surfaceflingerextension

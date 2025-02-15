@@ -28,9 +28,14 @@
 #include <compositionengine/impl/Display.h>
 #include <ui/DisplayStatInfo.h>
 #include <vector>
+#include <sys/stat.h>
+#include <fstream>
+#include <ui/GraphicBufferAllocator.h>
+#include <layerproto/LayerProtoParser.h>
 
 using aidl::vendor::qti::hardware::display::config::IDisplayConfig;
 using vendor::qti::hardware::display::composer::V3_1::IQtiComposerClient;
+using android::base::StringAppendF;
 
 using android::compositionengine::Display;
 using android::compositionengineextension::QtiRenderSurfaceExtension;
@@ -372,8 +377,24 @@ void QtiSurfaceFlingerExtension::qtiUpdateDisplaysList(sp<DisplayDevice> display
         return;
     }
 
+    bool prioritizePluggable =
+            (!qtiIsInternalDisplay(display) &&
+             mQtiFeatureManager->qtiIsExtensionFeatureEnabled(kPluggableVsyncPrioritized));
+
     if (addDisplay) {
-        mQtiDisplaysList.push_back(display);
+        if (prioritizePluggable) {
+            // Insert the pluggable display just before the first built-in display
+            // so that the earlier pluggable display remains the V-sync source.
+            auto it = mQtiDisplaysList.begin();
+            for (; it != mQtiDisplaysList.end(); it++) {
+                if (qtiIsInternalDisplay(*it)) {
+                    break;
+                }
+            }
+            mQtiDisplaysList.insert(it, display);
+        } else {
+            mQtiDisplaysList.push_back(display);
+        }
         ALOGV("Added display %s cur_size:%u", to_string(display->getPhysicalId()).c_str(),
               mQtiDisplaysList.size());
     } else {
@@ -2216,6 +2237,368 @@ void QtiSurfaceFlingerExtension::qtiFbScalingOnPowerChange(sp<DisplayDevice> dis
     // releases the FrameBuffer that was acquired as part of queueBuffer()
     compositionDisplay->getRenderSurface()->onPresentDisplayCompleted();
     mQtiDisplaySizeChanged = false;
+}
+
+void QtiSurfaceFlingerExtension::qtiDumpMini(std::string& result) {
+    Mutex::Autolock lock(mQtiFlinger->mStateLock);
+    for (const auto& [token, display] : mQtiFlinger->mDisplays) {
+        const auto displayId = PhysicalDisplayId::tryCast(display->getId());
+        if (!displayId) {
+            continue;
+        }
+        StringAppendF(&result, "Display %s HWC layers:\n", to_string(*displayId).c_str());
+        Layer::miniDumpHeader(result);
+        const DisplayDevice& displayDevice = *display;
+        FTL_FAKE_GUARD(kMainThreadContext,
+            mQtiFlinger->mLayerSnapshotBuilder.forEachVisibleSnapshot(
+                [&](const frontend::LayerSnapshot& snapshot) FTL_FAKE_GUARD(kMainThreadContext) {
+                    if (!snapshot.hasSomethingToDraw() ||
+                        displayDevice.getLayerStack() != snapshot.outputFilter.layerStack) {
+                        return;
+                    }
+
+                    auto seq = static_cast<const unsigned int>(snapshot.sequence);
+                    auto it = mQtiFlinger->mLegacyLayers.find(seq);
+                    if (it != mQtiFlinger->mLegacyLayers.end()) {
+                        mQtiFlinger->mDrawingState.traverseInZOrder(
+                                        [&](Layer* layer) { layer->miniDump(result, snapshot, displayDevice); });
+                    }
+        }));
+        result.append("\n");
+    }
+
+    result.append("h/w composer state:\n");
+    StringAppendF(&result, "  h/w composer %s\n",
+                  mQtiFlinger->mDebugDisableHWC ? "disabled" : "enabled");
+    mQtiFlinger->getHwComposer().dump(result);
+}
+
+status_t QtiSurfaceFlingerExtension::qtiDoDumpContinuous(int fd, const DumpArgs& args) {
+    // Format: adb shell dumpsys SurfaceFlinger --file --nolimit
+    size_t numArgs = args.size();
+    status_t err = NO_ERROR;
+
+    if (args[0] == String16("--allocated_buffers")) {
+        std::string dumpsys;
+        GraphicBufferAllocator& alloc(GraphicBufferAllocator::get());
+        alloc.dump(dumpsys);
+        write(fd, dumpsys.c_str(), dumpsys.size());
+        return err;
+    }
+
+    Mutex::Autolock _l(mFileDump.lock);
+    // Same command is used to start and end dump.
+    mFileDump.running = !mFileDump.running;
+    // selection of full dumpsys or not (defualt, dumpsys will be minimum required)
+    // Format: adb shell dumpsys SurfaceFlinger --file --nolimit --full-dump
+    if (mFileDump.running) {
+        std::ofstream ofs;
+        ofs.open(mFileDump.name, std::ofstream::out | std::ofstream::trunc);
+        if (!ofs) {
+            mFileDump.running = false;
+            err = UNKNOWN_ERROR;
+        } else {
+            ofs.close();
+            mFileDump.position = 0;
+            if (numArgs >= 2 && (args[1] == String16("--nolimit"))) {
+               mFileDump.noLimit = true;
+               if (numArgs == 3 && args[2] == String16("--full-dump"))
+                  mFileDump.fullDump = true;
+            } else {
+                mFileDump.noLimit = false;
+                mFileDump.fullDump = false;
+            }
+        }
+    }
+
+    std::string result;
+    result += mFileDump.running ? "Start" : "End";
+    result += mFileDump.noLimit ? " unlimited" : " fixed limit";
+    result += " dumpsys to file : ";
+    result += mFileDump.name;
+    result += "\n";
+    write(fd, result.c_str(), result.size());
+
+    return err;
+}
+
+void QtiSurfaceFlingerExtension::qtiDumpDrawCycle(bool prePrepare) {
+    Mutex::Autolock _l(mFileDump.lock);
+
+    // User might stop dump collection in middle of prepare & commit.
+    // Collect dumpsys again after commit and replace.
+    if (!mFileDump.running && !mFileDump.replaceAfterCommit) {
+        return;
+    }
+    Vector<String16> args;
+    std::string dumpsys;
+    {
+        if (mFileDump.fullDump) {
+            std::string compositionLayers;
+            StringAppendF(&compositionLayers, "Composition layers\n");
+            mQtiFlinger->mDrawingState.traverseInZOrder([&](Layer* layer) {
+                auto* compositionState = layer->getCompositionState();
+                if (!compositionState || !compositionState->isVisible) return;
+                android::base::StringAppendF(&compositionLayers, "* Layer %p (%s)\n", layer,
+                                                layer->getDebugName() ? layer->getDebugName()
+                                                                    : "<unknown>");
+                compositionState->dump(compositionLayers);
+            });
+            mQtiFlinger->dumpAll(args, compositionLayers, dumpsys);
+        } else {
+            qtiDumpMini(dumpsys);
+        }
+    }
+
+    if (mFileDump.fullDump) {
+        ftl::FakeGuard guard(kMainThreadContext);
+        perfetto::protos::LayersTraceFileProto traceFileProto = mQtiFlinger->mLayerTracing.createTraceFileProto();
+        perfetto::protos::LayersSnapshotProto* layersTrace = traceFileProto.add_entry();
+        perfetto::protos::LayersProto layersProto = mQtiFlinger->dumpDrawingStateProto(LayerTracing::TRACE_ALL);
+        layersTrace->mutable_layers()->Swap(&layersProto);
+        auto displayProtos = mQtiFlinger->dumpDisplayProto();
+        layersTrace->mutable_displays()->Swap(&displayProtos);
+        const auto layerTree = LayerProtoParser::generateLayerTree(layersTrace->layers());
+        dumpsys.append(LayerProtoParser::layerTreeToString(layerTree));
+        dumpsys.append("\n");
+        dumpsys.append("Offscreen Layers:\n");
+        for (Layer* offscreenLayer : mQtiFlinger->mOffscreenLayers) {
+            offscreenLayer->traverse(LayerVector::StateSet::Drawing,
+                                    [&](Layer* layer) {
+            layer->dumpOffscreenDebugInfo(dumpsys);});
+        }
+    }
+
+    char timeStamp[32];
+    char dataSize[32];
+    char hms[32];
+    long millis;
+    struct timeval tv;
+    struct tm *ptm;
+    gettimeofday(&tv, NULL);
+    ptm = localtime(&tv.tv_sec);
+    strftime (hms, sizeof (hms), "%H:%M:%S", ptm);
+    millis = tv.tv_usec / 1000;
+    snprintf(timeStamp, sizeof(timeStamp), "Timestamp: %s.%03ld", hms, millis);
+    snprintf(dataSize, sizeof(dataSize), "Size: %8zu", dumpsys.size());
+    std::fstream fs;
+    fs.open(mFileDump.name, std::ios::app);
+    if (!fs) {
+        ALOGE("Failed to open %s file for dumpsys", mFileDump.name);
+        return;
+    }
+    // Format:
+    //    | start code | after commit? | time stamp | dump size | dump data |
+    fs.seekp(mFileDump.position, std::ios::beg);
+    fs << "#@#@-- DUMPSYS START --@#@#" << std::endl;
+    fs << "PostCommit: " << ( prePrepare ? "false" : "true" ) << std::endl;
+    fs << timeStamp << std::endl;
+    fs << dataSize << std::endl;
+    fs << dumpsys << std::endl;
+
+    if (prePrepare) {
+        mFileDump.replaceAfterCommit = true;
+    } else {
+        mFileDump.replaceAfterCommit = false;
+        // Reposition only after commit.
+        // Keep file size to appx 20 MB limit by default, wrap around if exceeds.
+        mFileDump.position = fs.tellp();
+        if (!mFileDump.noLimit && (mFileDump.position > (20 * 1024 * 1024))) {
+            mFileDump.position = 0;
+        }
+    }
+    fs.close();
+}
+
+/*
+ * Methods for multiple displays
+ */
+// enable/disable h/w composer event
+// TODO: this should be made accessible only to EventThread
+// main thread function to enable/disable h/w composer event
+sp<DisplayDevice> QtiSurfaceFlingerExtension::qtiGetVsyncSource() {
+    // Return the vsync source from the active displays based on the order in which they are
+    // connected.
+    // Normally the order of priority is Primary (Built-in/Pluggable) followed by Secondary
+    // built-ins followed by Pluggable. But if mPluggableVsyncPrioritized is true then the
+    // order of priority is Pluggables followed by Primary and Secondary built-ins.
+    bool vsyncSourceReliableOnDoze =
+            mQtiFeatureManager->qtiIsExtensionFeatureEnabled(kVsyncSourceReliableOnDoze);
+
+    for (const auto& display : mQtiDisplaysList) {
+        auto mode = display->getPowerMode();
+        if (display->isVirtual() || (mode == hal::PowerMode::OFF) ||
+            (mode == hal::PowerMode::DOZE_SUSPEND)) {
+            continue;
+        }
+
+        if (vsyncSourceReliableOnDoze) {
+            if ((mode == hal::PowerMode::ON) || (mode == hal::PowerMode::DOZE)) {
+                return display;
+            }
+        } else if (mode == hal::PowerMode::ON) {
+            return display;
+        }
+    }
+
+    // In-case active displays are not present, source the vsync from
+    // the display which is in doze mode even if it is unreliable
+    // in the same order of display priority as above.
+    if (!vsyncSourceReliableOnDoze) {
+        for (const auto& display : mQtiDisplaysList) {
+            auto mode = display->getPowerMode();
+            if (display->isVirtual()) {
+                continue;
+            }
+
+            if (mode == hal::PowerMode::DOZE) {
+                return display;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+void QtiSurfaceFlingerExtension::qtiUpdateVsyncSource() NO_THREAD_SAFETY_ANALYSIS {
+    std::lock_guard<std::recursive_mutex> lockVsync(mQtiVsyncLock);
+    mQtiNextVsyncSource = qtiGetVsyncSource();
+
+    if (mQtiNextVsyncSource == NULL) {
+        // Switch off vsync for the last enabled source
+        if (mQtiActiveVsyncSource) {
+            mQtiFlinger->mScheduler->disableHardwareVsync(mQtiActiveVsyncSource->getPhysicalId(),
+                                                          true);
+        }
+        mQtiFlinger->mScheduler->enableSyntheticVsync();
+    } else if (mQtiNextVsyncSource && (mQtiActiveVsyncSource == NULL)) {
+        const auto activeMode = mQtiNextVsyncSource->refreshRateSelector().getActiveMode().modePtr;
+        mQtiFlinger->mScheduler->enableSyntheticVsync(false);
+        mQtiFlinger->mScheduler->resyncToHardwareVsync(mQtiNextVsyncSource->getPhysicalId(), true,
+                                                       activeMode.get());
+    } else if ((mQtiNextVsyncSource != NULL) && (mQtiActiveVsyncSource != NULL)) {
+        // Switch vsync to the new source
+        const auto activeMode = mQtiNextVsyncSource->refreshRateSelector().getActiveMode().modePtr;
+        mQtiFlinger->mScheduler->disableHardwareVsync(mQtiActiveVsyncSource->getPhysicalId(), true);
+        mQtiFlinger->mScheduler->resyncToHardwareVsync(mQtiNextVsyncSource->getPhysicalId(), true,
+                                                       activeMode.get());
+    }
+
+    if (mQtiNextVsyncSource) {
+        mQtiActiveVsyncSource = mQtiNextVsyncSource;
+        mQtiNextVsyncSource = NULL;
+    }
+}
+
+nsecs_t QtiSurfaceFlingerExtension::qtiGetVsyncPeriodFromHWC() const {
+    Mutex::Autolock lock(mQtiFlinger->mStateLock);
+    std::lock_guard<std::recursive_mutex> lockVsync(mQtiVsyncLock);
+
+    auto display = mQtiFlinger->getDefaultDisplayDeviceLocked();
+    if (mQtiNextVsyncSource) {
+        display = mQtiNextVsyncSource;
+    } else if (mQtiActiveVsyncSource) {
+        display = mQtiActiveVsyncSource;
+    }
+
+    if (display) {
+        return display->getVsyncPeriodFromHWC();
+    }
+
+    return 0;
+}
+
+void QtiSurfaceFlingerExtension::qtiUpdateNextVsyncSource() {
+    std::lock_guard<std::recursive_mutex> lockVsync(mQtiVsyncLock);
+    mQtiNextVsyncSource = qtiGetVsyncSource();
+}
+
+void QtiSurfaceFlingerExtension::qtiUpdateActiveVsyncSource() {
+    std::lock_guard<std::recursive_mutex> lockVsync(mQtiVsyncLock);
+    mQtiActiveVsyncSource = qtiGetVsyncSource();
+}
+
+bool QtiSurfaceFlingerExtension::qtiIsDummyDisplay(const sp<DisplayDevice>& display) {
+    return (std::find(mQtiDisplaysList.begin(), mQtiDisplaysList.end(), display) ==
+            mQtiDisplaysList.end());
+}
+
+void QtiSurfaceFlingerExtension::qtiUpdateActiveDisplayOnRemove(PhysicalDisplayId id)
+        FTL_FAKE_GUARD(kMainThreadContext) {
+    ConditionalLock lock(mQtiFlinger->mStateLock,
+                         std::this_thread::get_id() != mQtiFlinger->mMainThreadId);
+    // Need to check if the display we are removing is the active display
+    // If so make the next display in the display list the active display
+    if (id != mQtiFlinger->mActiveDisplayId) {
+         return;
+    }
+
+    for (const auto& displayTemp : mQtiDisplaysList) {
+        if (displayTemp->getPhysicalId() != id && displayTemp->isPoweredOn()) {
+            // once we find the next non-active display make it the active display
+            // if it is powered on
+
+            mQtiFlinger->onActiveDisplayChangedLocked(nullptr, *displayTemp);
+            qtiUpdateVsyncSource();
+            return;
+        }
+    }
+    // If no displays are powered on we set the next non-active display as active
+    for (const auto& displayTemp : mQtiDisplaysList) {
+        if (displayTemp->getPhysicalId() != id) {
+            mQtiFlinger->onActiveDisplayChangedLocked(nullptr, *displayTemp);
+            qtiUpdateVsyncSource();
+            return;
+        }
+    }
+}
+void QtiSurfaceFlingerExtension::qtiUpdateActiveDisplayOnPowerOn(PhysicalDisplayId id)
+        FTL_FAKE_GUARD(kMainThreadContext) {
+    ConditionalLock lock(mQtiFlinger->mStateLock,
+                         std::this_thread::get_id() != mQtiFlinger->mMainThreadId);
+
+    // If turning on a display that is powered off and active display is on
+    // must determine if this display should be the active display
+    for (const auto& displayTemp : mQtiDisplaysList) {
+        // If the active display is before the current display in displays list leave
+        // the current active display
+        if (displayTemp->getPhysicalId() == mQtiFlinger->mActiveDisplayId) {
+            break;
+        }
+
+        // Switch to the display being powered on
+        if (displayTemp->getPhysicalId() == id) {
+            mQtiFlinger->onActiveDisplayChangedLocked(nullptr, *displayTemp);
+            // Update with new vsync source
+            qtiUpdateVsyncSource();
+            break;
+        }
+    }
+}
+
+void QtiSurfaceFlingerExtension::qtiUpdateActiveDisplayOnPowerOff(PhysicalDisplayId id)
+        FTL_FAKE_GUARD(kMainThreadContext) {
+    ConditionalLock lock(mQtiFlinger->mStateLock,
+                         std::this_thread::get_id() != mQtiFlinger->mMainThreadId);
+
+    // Update active display
+    if (id == mQtiFlinger->mActiveDisplayId) {
+        for (const auto& displayTemp : mQtiDisplaysList) {
+            // Dont switch to a new display if its not powered on.
+            if (displayTemp->getPhysicalId() != id && displayTemp->isPoweredOn()) {
+                // Once we find the next non-active display make it the active display
+                mQtiFlinger->onActiveDisplayChangedLocked(nullptr, *displayTemp);
+                break;
+            }
+        }
+    }
+}
+sp<DisplayDevice> QtiSurfaceFlingerExtension::qtiGetVsyncSourceForFence() {
+    sp<DisplayDevice> vSyncSource = mQtiNextVsyncSource;
+    if (mQtiNextVsyncSource == NULL) {
+        vSyncSource = mQtiActiveVsyncSource;
+    }
+    return vSyncSource;
 }
 
 /*
